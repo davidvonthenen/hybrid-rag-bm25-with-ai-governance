@@ -11,8 +11,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 from tqdm import tqdm
 from opensearchpy import OpenSearch
@@ -26,13 +27,42 @@ LOGGER = get_logger(__name__)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Hybrid BM25 + vector ingestion for BBC dataset")
-    p.add_argument("--data-dir", type=str, default="bbc", help="Path to BBC dataset root (category subdirs)")
-    p.add_argument("--full-index", type=str, default="bbc-bm25", help="Full-document BM25 index")
-    p.add_argument("--bm25-chunk-index", type=str, default="bbc-bm25-chunks", help="Paragraph-level BM25 index")
-    p.add_argument("--vec-chunk-index", type=str, default="bbc-vec-chunks", help="Paragraph-level vector index")
-    p.add_argument("--batch-size", type=int, default=32, help="Vector batch size (paragraphs)")
-    return p.parse_args(argv)
+    """Parse CLI arguments for the ingestion job."""
+
+    parser = argparse.ArgumentParser(
+        description="Hybrid BM25 + vector ingestion for BBC dataset"
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="bbc",
+        help="Path to BBC dataset root (category subdirs)",
+    )
+    parser.add_argument(
+        "--full-index",
+        type=str,
+        default="bbc-bm25",
+        help="Full-document BM25 index",
+    )
+    parser.add_argument(
+        "--bm25-chunk-index",
+        type=str,
+        default="bbc-bm25-chunks",
+        help="Paragraph-level BM25 index",
+    )
+    parser.add_argument(
+        "--vec-chunk-index",
+        type=str,
+        default="bbc-vec-chunks",
+        help="Paragraph-level vector index",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Vector batch size (paragraphs)",
+    )
+    return parser.parse_args(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +71,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def split_into_paragraphs(text: str) -> List[str]:
     """Split text into non-empty paragraphs separated by blank lines."""
+
     paragraphs: List[str] = []
     current: List[str] = []
 
@@ -60,6 +91,8 @@ def split_into_paragraphs(text: str) -> List[str]:
 
 
 def extract_entities(text: str) -> List[str]:
+    """Run NER and return normalized entity strings."""
+
     ner_result = post_ner(text)
     return normalize_entities(ner_result)
 
@@ -162,6 +195,48 @@ def iter_bbc_files(data_dir: Path):
             yield category, fp, text
 
 
+@dataclass
+class IngestStats:
+    """Counters for the ingestion run."""
+
+    docs: int = 0
+    bm25_chunks: int = 0
+    vector_chunks: int = 0
+
+
+def _build_chunk_documents(
+    paragraphs: Iterable[str],
+    *,
+    category: str,
+    rel_path: str,
+    chunk_count: int,
+    now_ms: int,
+) -> List[Dict[str, object]]:
+    """Create chunk documents for BM25 indexing."""
+
+    chunk_docs: List[Dict[str, object]] = []
+    for idx, paragraph in enumerate(paragraphs):
+        para = paragraph.strip()
+        if not para:
+            continue
+        chunk_terms = extract_entities(para) if para else []
+        chunk_docs.append(
+            {
+                "content": para,
+                "category": category,
+                "filepath": rel_path,
+                "parent_filepath": rel_path,
+                "chunk_index": idx,
+                "chunk_count": chunk_count,
+                "explicit_terms": chunk_terms,
+                "explicit_terms_text": " ".join(chunk_terms) if chunk_terms else "",
+                "ingested_at_ms": now_ms,
+                "doc_version": now_ms,
+            }
+        )
+    return chunk_docs
+
+
 # ---------------------------------------------------------------------------
 # Ingestion logic
 # ---------------------------------------------------------------------------
@@ -193,17 +268,13 @@ def ingest_hybrid(
     ensure_vector_index(vec_client, vec_client.settings.opensearch_vector_index, embedder.dimension)
 
     now_ms = int(time.time() * 1000)
-
-    total_docs = 0
-    total_chunks_bm25 = 0
-    total_chunks_vec = 0
+    stats = IngestStats()
 
     progress = tqdm(desc="Hybrid ingest (docs)", unit="doc")
     try:
         for category, fp, text in iter_bbc_files(data_dir):
             rel_path = fp.relative_to(data_dir).as_posix()
 
-            # ---------------- BM25 full-document ----------------
             explicit_terms_doc = extract_entities(text)
             full_doc = {
                 "content": text,
@@ -214,78 +285,74 @@ def ingest_hybrid(
                 "ingested_at_ms": now_ms,
                 "doc_version": now_ms,
             }
-            bm25_client.index(index=bm25_client.settings.opensearch_full_index, id=rel_path, body=full_doc, refresh=False)
+            bm25_client.index(
+                index=bm25_client.settings.opensearch_full_index,
+                id=rel_path,
+                body=full_doc,
+                refresh=False,
+            )
 
-            # ---------------- Paragraph-level chunking ----------------
             paragraphs = split_into_paragraphs(text)
-            chunk_count = len(paragraphs)
+            chunk_docs = _build_chunk_documents(
+                paragraphs,
+                category=category,
+                rel_path=rel_path,
+                chunk_count=len(paragraphs),
+                now_ms=now_ms,
+            )
 
-            # BM25 chunks
-            for idx, paragraph in enumerate(paragraphs):
-                para = paragraph.strip()
-                if not para:
-                    continue
-                chunk_terms = extract_entities(para) if para else []
-                chunk_doc = {
-                    "content": para,
-                    "category": category,
-                    "filepath": rel_path,
-                    "parent_filepath": rel_path,
-                    "chunk_index": idx,
-                    "chunk_count": chunk_count,
-                    "explicit_terms": chunk_terms,
-                    "explicit_terms_text": " ".join(chunk_terms) if chunk_terms else "",
-                    "ingested_at_ms": now_ms,
-                    "doc_version": now_ms,
-                }
-                chunk_id = f"{rel_path}::chunk-{idx:03d}"
-                bm25_client.index(index=bm25_client.settings.opensearch_long_index, id=chunk_id, body=chunk_doc, refresh=False)
-                total_chunks_bm25 += 1
-
-            # Vector chunks: reuse the same paragraphs so RAG can align hits
-            vec_chunks: List[Dict[str, object]] = []
-            for idx, paragraph in enumerate(paragraphs):
-                para = paragraph.strip()
-                if not para:
-                    continue
-                vec_chunks.append(
-                    {
-                        "category": category,
-                        "rel_path": rel_path,
-                        "chunk_index": idx,
-                        "chunk_count": chunk_count,
-                        "text": para,
-                    }
+            for chunk_doc in chunk_docs:
+                chunk_id = f"{rel_path}::chunk-{int(chunk_doc['chunk_index']):03d}"
+                bm25_client.index(
+                    index=bm25_client.settings.opensearch_long_index,
+                    id=chunk_id,
+                    body=chunk_doc,
+                    refresh=False,
                 )
+                stats.bm25_chunks += 1
 
-            # batch embedding per document
+            vec_chunks: List[Dict[str, object]] = [
+                {
+                    "category": category,
+                    "rel_path": rel_path,
+                    "chunk_index": chunk_doc["chunk_index"],
+                    "chunk_count": chunk_doc["chunk_count"],
+                    "text": chunk_doc["content"],
+                }
+                for chunk_doc in chunk_docs
+            ]
+
             for i in range(0, len(vec_chunks), batch_size):
                 batch = vec_chunks[i : i + batch_size]
                 if not batch:
                     continue
                 texts = [c["text"] for c in batch]
                 embeddings = embedder.encode(texts)
-                for c, emb in zip(batch, embeddings):
-                    emb_vec = to_list(emb)
-                    chunk_id = f"{c['rel_path']}::chunk-{c['chunk_index']:03d}"
+                for chunk_meta, embedding in zip(batch, embeddings):
+                    emb_vec = to_list(embedding)
+                    chunk_id = f"{chunk_meta['rel_path']}::chunk-{int(chunk_meta['chunk_index']):03d}"
                     vec_id = doc_sha1(chunk_id)
                     body = {
-                        "path": c["rel_path"],
-                        "category": c["category"],
-                        "chunk_index": c["chunk_index"],
-                        "chunk_count": c["chunk_count"],
-                        "text": c["text"],
+                        "path": chunk_meta["rel_path"],
+                        "category": chunk_meta["category"],
+                        "chunk_index": chunk_meta["chunk_index"],
+                        "chunk_count": chunk_meta["chunk_count"],
+                        "text": chunk_meta["text"],
                         "embedding": emb_vec,
                     }
-                    vec_client.index(index=vec_client.settings.opensearch_vector_index, id=vec_id, body=body, refresh=False)
-                    total_chunks_vec += 1
+                    vec_client.index(
+                        index=vec_client.settings.opensearch_vector_index,
+                        id=vec_id,
+                        body=body,
+                        refresh=False,
+                    )
+                    stats.vector_chunks += 1
 
-            total_docs += 1
+            stats.docs += 1
             progress.update(1)
     finally:
         progress.close()
 
-    # Final refresh so queries see everything
     bm25_client.indices.refresh(index=bm25_client.settings.opensearch_full_index)
     bm25_client.indices.refresh(index=bm25_client.settings.opensearch_long_index)
     vec_client.indices.refresh(index=vec_client.settings.opensearch_vector_index)
@@ -293,9 +360,9 @@ def ingest_hybrid(
     LOGGER.info(
         "Hybrid ingest complete: %d docs, %d BM25 chunks, %d vector chunks "
         "into indices full='%s', bm25_chunks='%s', vec_chunks='%s'",
-        total_docs,
-        total_chunks_bm25,
-        total_chunks_vec,
+        stats.docs,
+        stats.bm25_chunks,
+        stats.vector_chunks,
         bm25_client.settings.opensearch_full_index,
         bm25_client.settings.opensearch_long_index,
         vec_client.settings.opensearch_vector_index,

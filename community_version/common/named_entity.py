@@ -1,4 +1,4 @@
-"""Named Entity Recognition (NER) client utilities."""
+"""Named entity recognition helpers."""
 from __future__ import annotations
 
 import json
@@ -14,20 +14,8 @@ LOGGER = get_logger(__name__)
 
 
 def post_ner(text: str, settings: Optional[Settings] = None) -> Dict[str, Any]:
-    """
-    Call the configured NER service with the given text.
+    """Call the configured NER service with the given text."""
 
-    Parameters
-    ----------
-    text:
-        The input text to analyze.
-    settings:
-        Application settings providing the NER URL and timeout.
-
-    Returns
-    -------
-    Parsed JSON payload from the NER service.
-    """
     if settings is None:
         settings = load_settings()
     url = settings.ner_url
@@ -60,6 +48,7 @@ def post_ner(text: str, settings: Optional[Settings] = None) -> Dict[str, Any]:
 
 def normalize_entities(ner_result: Dict[str, Any]) -> List[str]:
     """Return normalized (lowercased, de-duplicated) entity strings."""
+
     seen = set()
     out: List[str] = []
 

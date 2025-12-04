@@ -1,43 +1,50 @@
 """Configuration loading utilities for the RAG service."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
 
 def _get_str(name: str, default_val: str) -> str:
-    v = os.getenv(name)
-    if v is None:
-        return default_val
-    return v
+    """Return an environment variable or ``default_val`` if unset."""
+
+    value = os.getenv(name)
+    return default_val if value is None else value
+
 
 def _get_int(name: str, default_val: int) -> int:
-    v = os.getenv(name)
-    if v is None or v == "":
+    """Safely coerce an environment variable to ``int`` with fallback."""
+
+    value = os.getenv(name)
+    if value is None or value == "":
         return default_val
     try:
-        return int(v)
+        return int(value)
     except ValueError:
         return default_val
 
 
 def _get_bool(name: str, default_val: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
+    """Return a boolean flag parsed from common truthy strings."""
+
+    value = os.getenv(name)
+    if value is None:
         return default_val
-    return v.lower() in ("1", "true", "yes", "on")
+    return value.lower() in ("1", "true", "yes", "on")
 
 
 def _get_float(name: str, default_val: float) -> float:
-    v = os.getenv(name)
-    if v is None or v == "":
+    """Safely coerce an environment variable to ``float`` with fallback."""
+
+    value = os.getenv(name)
+    if value is None or value == "":
         return default_val
     try:
-        return float(v)
+        return float(value)
     except ValueError:
         return default_val
 
