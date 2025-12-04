@@ -350,7 +350,7 @@ def search_one(
         )
     except TransportError as exc:
         # Soft-fail: return empty result + diagnostic
-        LOGGER.error(
+        LOGGER.warning(
             "OpenSearch search_one error on %s/%s: %s",
             label,
             index_name,
