@@ -18,12 +18,22 @@ from typing import Dict, Iterable, List, Sequence
 from tqdm import tqdm
 from opensearchpy import OpenSearch
 
+import spacy
 from common.opensearch_client import create_long_client, create_vector_client
 from common.named_entity import post_ner, normalize_entities
 from common.embeddings import EmbeddingModel, to_list
 from common.logging import get_logger
 
 LOGGER = get_logger(__name__)
+
+# Load spacy model for chunking
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    LOGGER.info("Downloading spacy model 'en_core_web_sm'...")
+    from spacy.cli import download
+    download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -88,6 +98,65 @@ def split_into_paragraphs(text: str) -> List[str]:
         paragraphs.append("\n".join(current).strip())
 
     return paragraphs or ([text.strip()] if text.strip() else [])
+
+
+def split_into_chunks(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+    """
+    Split text into chunks of approximately `chunk_size` characters with `overlap`.
+    Respects sentence boundaries using SpaCy.
+    """
+    if not text.strip():
+        return []
+
+    doc = nlp(text)
+    sentences = [sent.text.strip() for sent in doc.sents]
+
+    chunks = []
+    i = 0
+    while i < len(sentences):
+        chunk_sents = []
+        chunk_len = 0
+        j = i
+
+        while j < len(sentences):
+            sent = sentences[j]
+            sent_len = len(sent)
+
+            # If adding this sentence exceeds chunk size...
+            if chunk_len + sent_len > chunk_size and chunk_sents:
+                break
+
+            chunk_sents.append(sent)
+            chunk_len += sent_len + 1  # +1 for space
+            j += 1
+
+        if not chunk_sents and j < len(sentences):
+            # Single sentence is larger than chunk_size, take it anyway
+            chunk_sents.append(sentences[j])
+            j += 1
+
+        chunks.append(" ".join(chunk_sents))
+
+        if j >= len(sentences):
+            break
+
+        # Calculate start of next chunk (overlap)
+        overlap_len = 0
+        next_i = j
+        while next_i > i:
+            sent_len = len(sentences[next_i-1])
+            if overlap_len + sent_len > overlap:
+                break
+            overlap_len += sent_len + 1
+            next_i -= 1
+
+        # Ensure we always advance
+        if next_i == i:
+            next_i += 1
+
+        i = next_i
+
+    return chunks
 
 
 def extract_entities(text: str) -> List[str]:
@@ -292,12 +361,12 @@ def ingest_hybrid(
                 refresh=False,
             )
 
-            paragraphs = split_into_paragraphs(text)
+            chunks = split_into_chunks(text, chunk_size=1000, overlap=200)
             chunk_docs = _build_chunk_documents(
-                paragraphs,
+                chunks,
                 category=category,
                 rel_path=rel_path,
-                chunk_count=len(paragraphs),
+                chunk_count=len(chunks),
                 now_ms=now_ms,
             )
 
